@@ -53,6 +53,10 @@ specifically for the percent-encoded case (a plain literal-`..` test
 alone would never have caught this). Fixed by moving the `..` check to
 run on the decoded path, not the raw one.
 
+## Real bug found in testing: crashing instead of erroring on a taken port
+
+`bind(2)` failing (port already in use, most commonly) went through the same generic `checkErrno` helper as every other syscall in `main`, which just returns `error.SyscallFailed` and lets Zig's default `try` propagate it as an unhandled error with a raw stack trace. A user starting a second instance on the same port got a crash dump instead of a message telling them what actually went wrong. Fixed by checking the bind result directly, recognizing `EADDRINUSE` specifically, and printing a real message ("port N is already in use...") before exiting cleanly instead of unwinding.
+
 ## Scope cuts from the original idea
 
 On-the-fly gzip compression stayed out of this build. Zig's
