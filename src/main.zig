@@ -78,7 +78,17 @@ pub fn main() !void {
         .port = std.mem.nativeToBig(u16, port),
         .addr = 0,
     };
-    _ = try checkErrno(linux.bind(sock, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)));
+    const bind_rc = linux.bind(sock, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+    const bind_signed: isize = @bitCast(bind_rc);
+    if (bind_signed < 0) {
+        const errno: usize = @intCast(-bind_signed);
+        if (errno == @intFromEnum(std.posix.E.ADDRINUSE)) {
+            std.debug.print("{s}zserve{s}: port {d} is already in use, pick a different port or stop whatever's already listening on it\n", .{ COL_ACCENT, COL_RESET, port });
+        } else {
+            std.debug.print("{s}zserve{s}: could not bind to port {d} (errno {d})\n", .{ COL_ACCENT, COL_RESET, port, errno });
+        }
+        std.process.exit(1);
+    }
     _ = try checkErrno(linux.listen(sock, 16));
 
     var stats = http.Stats{};
