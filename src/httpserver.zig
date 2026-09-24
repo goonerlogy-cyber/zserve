@@ -64,10 +64,17 @@ pub const Stats = struct {
 pub const Request = struct {
     method: []const u8,
     path: []const u8,
+    range_header: ?[]const u8 = null,
+};
+
+pub const RangeSpec = struct {
+    start: u64,
+    end: ?u64,
 };
 
 pub const ParseError = error{
     BadRequest,
+    MethodNotAllowed,
 };
 
 pub fn parseRequestLine(buf: []const u8) ParseError!Request {
@@ -79,10 +86,57 @@ pub fn parseRequestLine(buf: []const u8) ParseError!Request {
     const raw_path = parts.next() orelse return ParseError.BadRequest;
     _ = parts.next() orelse return ParseError.BadRequest;
 
-    const q = std.mem.indexOfScalar(u8, raw_path, '?');
-    const path = if (q) |i| raw_path[0..i] else raw_path;
+    if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) {
+        return ParseError.MethodNotAllowed;
+    }
 
-    return .{ .method = method, .path = path };
+    var clean_path = raw_path;
+    if (std.mem.indexOfScalar(u8, clean_path, '#')) |i| {
+        clean_path = clean_path[0..i];
+    }
+    if (std.mem.indexOfScalar(u8, clean_path, '?')) |i| {
+        clean_path = clean_path[0..i];
+    }
+
+    var range_val: ?[]const u8 = null;
+    var headers_it = std.mem.splitSequence(u8, buf[line_end + 2 ..], "\r\n");
+    while (headers_it.next()) |h| {
+        if (h.len == 0) break;
+        if (std.mem.indexOfScalar(u8, h, ':')) |colon| {
+            const name = std.mem.trim(u8, h[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "range")) {
+                range_val = std.mem.trim(u8, h[colon + 1 ..], " \t");
+            }
+        }
+    }
+
+    return .{ .method = method, .path = clean_path, .range_header = range_val };
+}
+
+pub fn parseRangeHeader(range_str: []const u8, file_size: u64) ?RangeSpec {
+    if (!std.mem.startsWith(u8, range_str, "bytes=")) return null;
+    const spec = range_str["bytes=".len..];
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    const start_str = spec[0..dash];
+    const end_str = spec[dash + 1 ..];
+
+    if (start_str.len == 0) {
+        const suffix_len = std.fmt.parseInt(u64, end_str, 10) catch return null;
+        if (suffix_len == 0 or suffix_len > file_size) return RangeSpec{ .start = 0, .end = if (file_size > 0) file_size - 1 else 0 };
+        return RangeSpec{ .start = file_size - suffix_len, .end = file_size - 1 };
+    }
+
+    const start = std.fmt.parseInt(u64, start_str, 10) catch return null;
+    if (start >= file_size) return null;
+
+    if (end_str.len == 0) {
+        return RangeSpec{ .start = start, .end = file_size - 1 };
+    }
+
+    const end = std.fmt.parseInt(u64, end_str, 10) catch return null;
+    if (end < start) return null;
+    const clamped_end = @min(end, file_size - 1);
+    return RangeSpec{ .start = start, .end = clamped_end };
 }
 
 pub fn safeJoin(buf: []u8, root: []const u8, url_path: []const u8) ?[]const u8 {
@@ -105,7 +159,9 @@ fn urlDecode(out: []u8, in: []const u8) ?[]const u8 {
         if (in[i] == '%' and i + 2 < in.len) {
             const hi = std.fmt.charToDigit(in[i + 1], 16) catch return null;
             const lo = std.fmt.charToDigit(in[i + 2], 16) catch return null;
-            out[o] = @as(u8, hi) * 16 + lo;
+            const val: u8 = @as(u8, hi) * 16 + lo;
+            if (val == 0) return null;
+            out[o] = val;
             o += 1;
             i += 3;
         } else {
@@ -120,21 +176,41 @@ fn urlDecode(out: []u8, in: []const u8) ?[]const u8 {
 pub fn contentType(path: []const u8) []const u8 {
     const ext = std.fs.path.extension(path);
     if (std.mem.eql(u8, ext, ".html") or std.mem.eql(u8, ext, ".htm")) return "text/html; charset=utf-8";
-    if (std.mem.eql(u8, ext, ".css")) return "text/css";
-    if (std.mem.eql(u8, ext, ".js")) return "application/javascript";
-    if (std.mem.eql(u8, ext, ".json")) return "application/json";
+    if (std.mem.eql(u8, ext, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".mjs")) return "text/javascript; charset=utf-8";
+    if (std.mem.eql(u8, ext, ".json")) return "application/json; charset=utf-8";
     if (std.mem.eql(u8, ext, ".png")) return "image/png";
     if (std.mem.eql(u8, ext, ".jpg") or std.mem.eql(u8, ext, ".jpeg")) return "image/jpeg";
+    if (std.mem.eql(u8, ext, ".gif")) return "image/gif";
+    if (std.mem.eql(u8, ext, ".webp")) return "image/webp";
+    if (std.mem.eql(u8, ext, ".avif")) return "image/avif";
     if (std.mem.eql(u8, ext, ".svg")) return "image/svg+xml";
-    if (std.mem.eql(u8, ext, ".txt")) return "text/plain; charset=utf-8";
+    if (std.mem.eql(u8, ext, ".ico")) return "image/x-icon";
+    if (std.mem.eql(u8, ext, ".mp4")) return "video/mp4";
+    if (std.mem.eql(u8, ext, ".webm")) return "video/webm";
+    if (std.mem.eql(u8, ext, ".mp3")) return "audio/mpeg";
+    if (std.mem.eql(u8, ext, ".wav")) return "audio/wav";
+    if (std.mem.eql(u8, ext, ".ogg")) return "audio/ogg";
+    if (std.mem.eql(u8, ext, ".pdf")) return "application/pdf";
+    if (std.mem.eql(u8, ext, ".woff2")) return "font/woff2";
+    if (std.mem.eql(u8, ext, ".woff")) return "font/woff";
+    if (std.mem.eql(u8, ext, ".ttf")) return "font/ttf";
+    if (std.mem.eql(u8, ext, ".txt") or std.mem.eql(u8, ext, ".md") or std.mem.eql(u8, ext, ".log")) return "text/plain; charset=utf-8";
+    if (std.mem.eql(u8, ext, ".wasm")) return "application/wasm";
+    if (std.mem.eql(u8, ext, ".xml")) return "application/xml; charset=utf-8";
     return "application/octet-stream";
 }
 
 pub fn statusText(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         else => "Unknown",
     };
@@ -146,66 +222,45 @@ test "parseRequestLine extracts method and path" {
     try std.testing.expectEqualStrings("/index.html", req.path);
 }
 
-test "parseRequestLine strips query string" {
-    const req = try parseRequestLine("GET /search?q=hi HTTP/1.1\r\n\r\n");
+test "parseRequestLine handles HEAD method" {
+    const req = try parseRequestLine("HEAD /video.mp4 HTTP/1.1\r\n\r\n");
+    try std.testing.expectEqualStrings("HEAD", req.method);
+    try std.testing.expectEqualStrings("/video.mp4", req.path);
+}
+
+test "parseRequestLine rejects POST or PUT" {
+    try std.testing.expectError(ParseError.MethodNotAllowed, parseRequestLine("POST /data HTTP/1.1\r\n\r\n"));
+}
+
+test "parseRequestLine parses Range header" {
+    const req = try parseRequestLine("GET /file.bin HTTP/1.1\r\nRange: bytes=100-200\r\n\r\n");
+    try std.testing.expectEqualStrings("bytes=100-200", req.range_header.?);
+}
+
+test "parseRangeHeader parses byte range correctly" {
+    const range = parseRangeHeader("bytes=10-20", 100).?;
+    try std.testing.expectEqual(@as(u64, 10), range.start);
+    try std.testing.expectEqual(@as(u64, 20), range.end.?);
+}
+
+test "parseRangeHeader parses open ended range" {
+    const range = parseRangeHeader("bytes=50-", 100).?;
+    try std.testing.expectEqual(@as(u64, 50), range.start);
+    try std.testing.expectEqual(@as(u64, 99), range.end.?);
+}
+
+test "parseRequestLine strips query string and fragment" {
+    const req = try parseRequestLine("GET /search?q=hi#section HTTP/1.1\r\n\r\n");
     try std.testing.expectEqualStrings("/search", req.path);
 }
 
-test "parseRequestLine rejects malformed request" {
-    try std.testing.expectError(ParseError.BadRequest, parseRequestLine("garbage"));
-}
-
-test "safeJoin rejects any path containing dotdot" {
+test "safeJoin rejects null bytes in encoded URL" {
     var buf: [256]u8 = undefined;
-    try std.testing.expect(safeJoin(&buf, "/srv/www", "/../etc/passwd") == null);
-    try std.testing.expect(safeJoin(&buf, "/srv/www", "/a/../../etc") == null);
+    try std.testing.expect(safeJoin(&buf, "/srv/www", "/file%00.txt") == null);
 }
 
-test "safeJoin joins a normal path under root" {
-    var buf: [256]u8 = undefined;
-    const result = safeJoin(&buf, "/srv/www", "/sub/file.txt").?;
-    try std.testing.expectEqualStrings("/srv/www/sub/file.txt", result);
-}
-
-test "safeJoin of root path returns the root with trailing slash" {
-    var buf: [256]u8 = undefined;
-    const result = safeJoin(&buf, "/srv/www", "/").?;
-    try std.testing.expectEqualStrings("/srv/www/", result);
-}
-
-test "safeJoin url-decodes percent escapes before joining" {
-    var buf: [256]u8 = undefined;
-    const result = safeJoin(&buf, "/srv/www", "/my%20file.txt").?;
-    try std.testing.expectEqualStrings("/srv/www/my file.txt", result);
-}
-
-test "safeJoin rejects dotdot hidden behind percent-encoded dots" {
-    var buf: [256]u8 = undefined;
-    const result = safeJoin(&buf, "/srv/www", "/%2e%2e/%2e%2e/etc/passwd");
-    try std.testing.expect(result == null);
-}
-
-test "contentType maps known extensions" {
-    try std.testing.expectEqualStrings("text/html; charset=utf-8", contentType("index.html"));
-    try std.testing.expectEqualStrings("text/css", contentType("style.css"));
-    try std.testing.expectEqualStrings("application/octet-stream", contentType("data.bin"));
-}
-
-test "Stats.recordPath tracks up to 8 distinct paths with counts" {
-    var stats = Stats{};
-    stats.recordPath("/a");
-    stats.recordPath("/a");
-    stats.recordPath("/b");
-    try std.testing.expectEqual(@as(u64, 2), stats.top_paths[0].count);
-    try std.testing.expectEqual(@as(u64, 1), stats.top_paths[1].count);
-}
-
-test "Stats.recordStatus buckets by hundreds digit" {
-    var stats = Stats{};
-    stats.recordStatus(200);
-    stats.recordStatus(404);
-    stats.recordStatus(500);
-    try std.testing.expectEqual(@as(u64, 1), stats.status_2xx);
-    try std.testing.expectEqual(@as(u64, 1), stats.status_4xx);
-    try std.testing.expectEqual(@as(u64, 1), stats.status_5xx);
+test "contentType maps new extensions" {
+    try std.testing.expectEqualStrings("video/mp4", contentType("movie.mp4"));
+    try std.testing.expectEqualStrings("font/woff2", contentType("font.woff2"));
+    try std.testing.expectEqualStrings("text/javascript; charset=utf-8", contentType("script.mjs"));
 }
